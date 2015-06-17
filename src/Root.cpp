@@ -37,7 +37,6 @@
 
 
 cRoot * cRoot::s_Root = nullptr;
-bool cRoot::m_ShouldStop = false;
 
 
 
@@ -51,10 +50,10 @@ cRoot::cRoot(void) :
 	m_FurnaceRecipe(nullptr),
 	m_WebAdmin(nullptr),
 	m_PluginManager(nullptr),
-	m_MojangAPI(nullptr),
-	m_bRestart(false)
+	m_MojangAPI(nullptr)
 {
 	s_Root = this;
+	m_InputThreadRunFlag.clear();
 }
 
 
@@ -72,26 +71,41 @@ cRoot::~cRoot()
 
 void cRoot::InputThread(cRoot & a_Params)
 {
-	cLogCommandOutputCallback Output;
+	/* This thread waits for input in a non-blocking fashion
+	This is to allow the server to be stopped or restarted by means other than the input console
+	Standard methods, such as getline/cin streams, block until input
+	*/
 
-	while (!cRoot::m_ShouldStop && !a_Params.m_bRestart && !m_TerminateEventRaised && std::cin.good())
+	cLogCommandOutputCallback Output;
+	AString Command;
+
+	while (a_Params.m_InputThreadRunFlag.test_and_set() && std::cin.good())
 	{
-		AString Command;
-		std::getline(std::cin, Command);
-		if (!Command.empty())
+		if (!_kbhit())
 		{
+			// Ignore if keyboard not pressed
+			continue;
+		}
+
+		char Character = static_cast<char>(_getche());  // Obtain in a non-blocking fasion one entered character (not exactly standard or modern, but oh well)
+		if (Character != '\r')
+		{
+			// Continue building command if newline not pressed
+			Command += Character;
+		}
+		else if (!Command.empty())
+		{
+			// Execute and clear command string when submitted
 			a_Params.ExecuteConsoleCommand(TrimString(Command), Output);
+			Command.clear();
 		}
 	}
 
-	if (m_TerminateEventRaised || !std::cin.good())
+	// We have come here because the std::cin has received an EOF / a terminate signal has been sent, and the server is still running
+	if (!std::cin.good())
 	{
-		// We have come here because the std::cin has received an EOF / a terminate signal has been sent, and the server is still running
 		// Stop the server:
-		if (!m_RunAsService)  // Dont kill if running as a service
-		{
-			a_Params.m_ShouldStop = true;
-		}
+		a_Params.QueueExecuteConsoleCommand("stop");
 	}
 }
 
@@ -99,7 +113,7 @@ void cRoot::InputThread(cRoot & a_Params)
 
 
 
-void cRoot::Start(std::unique_ptr<cSettingsRepositoryInterface> overridesRepo)
+void cRoot::Start(std::unique_ptr<cSettingsRepositoryInterface> a_OverridesRepo)
 {
 	#ifdef _WIN32
 	HWND hwnd = GetConsoleWindow();
@@ -124,156 +138,154 @@ void cRoot::Start(std::unique_ptr<cSettingsRepositoryInterface> overridesRepo)
 		cSelfTests::ExecuteAll();
 	#endif
 
-	cDeadlockDetect dd;
+	cDeadlockDetect dd;	
+	auto BeginTime = std::chrono::steady_clock::now();
 
-	m_ShouldStop = false;
-	while (!m_ShouldStop)
+	LoadGlobalSettings();
+
+	LOG("Creating new server instance...");
+	m_Server = new cServer();
+
+	LOG("Reading server config...");
+
+	auto IniFile = cpp14::make_unique<cIniFile>();
+	if (!IniFile->ReadFile("settings.ini"))
 	{
-		auto BeginTime = std::chrono::steady_clock::now();
-		m_bRestart = false;
-
-		LoadGlobalSettings();
-
-		LOG("Creating new server instance...");
-		m_Server = new cServer();
-
-		LOG("Reading server config...");
-
-		auto IniFile = cpp14::make_unique<cIniFile>();
-		if (!IniFile->ReadFile("settings.ini"))
-		{
-			LOGWARN("Regenerating settings.ini, all settings will be reset");
-			IniFile->AddHeaderComment(" This is the main server configuration");
-			IniFile->AddHeaderComment(" Most of the settings here can be configured using the webadmin interface, if enabled in webadmin.ini");
-			IniFile->AddHeaderComment(" See: http://wiki.mc-server.org/doku.php?id=configure:settings.ini for further configuration help");
-		}
-		auto settingsRepo = cpp14::make_unique<cOverridesSettingsRepository>(std::move(IniFile), std::move(overridesRepo));
-
-		LOG("Starting server...");
-		m_MojangAPI = new cMojangAPI;
-		bool ShouldAuthenticate = settingsRepo->GetValueSetB("Authentication", "Authenticate", true);
-		m_MojangAPI->Start(*settingsRepo, ShouldAuthenticate);  // Mojang API needs to be started before plugins, so that plugins may use it for DB upgrades on server init
-		if (!m_Server->InitServer(*settingsRepo, ShouldAuthenticate))
-		{
-			settingsRepo->Flush();
-			LOGERROR("Failure starting server, aborting...");
-			return;
-		}
-
-		m_WebAdmin = new cWebAdmin();
-		m_WebAdmin->Init();
-
-		LOGD("Loading settings...");
-		m_RankManager.reset(new cRankManager());
-		m_RankManager->Initialize(*m_MojangAPI);
-		m_CraftingRecipes = new cCraftingRecipes;
-		m_FurnaceRecipe   = new cFurnaceRecipe();
-
-		LOGD("Loading worlds...");
-		LoadWorlds(*settingsRepo);
-
-		LOGD("Loading plugin manager...");
-		m_PluginManager = new cPluginManager();
-		m_PluginManager->ReloadPluginsNow(*settingsRepo);
-
-		LOGD("Loading MonsterConfig...");
-		m_MonsterConfig = new cMonsterConfig;
-
-		// This sets stuff in motion
-		LOGD("Starting Authenticator...");
-		m_Authenticator.Start(*settingsRepo);
-
-		LOGD("Starting worlds...");
-		StartWorlds();
-
-		if (settingsRepo->GetValueSetB("DeadlockDetect", "Enabled", true))
-		{
-			LOGD("Starting deadlock detector...");
-			dd.Start(settingsRepo->GetValueSetI("DeadlockDetect", "IntervalSec", 20));
-		}
-
-		settingsRepo->Flush();
-
-		LOGD("Finalising startup...");
-		if (m_Server->Start())
-		{
-			m_WebAdmin->Start();
-
-			#if !defined(ANDROID_NDK)
-			LOGD("Starting InputThread...");
-			try
-			{
-				m_InputThread = std::thread(InputThread, std::ref(*this));
-				m_InputThread.detach();
-			}
-			catch (std::system_error & a_Exception)
-			{
-				LOGERROR("cRoot::Start (std::thread) error %i: could not construct input thread; %s", a_Exception.code().value(), a_Exception.what());
-			}
-			#endif
-
-			LOG("Startup complete, took %ldms!", static_cast<long int>(std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - BeginTime).count()));
-
-			// Save the current time
-			m_StartTime = std::chrono::steady_clock::now();
-
-			#ifdef _WIN32
-			EnableMenuItem(hmenu, SC_CLOSE, MF_ENABLED);  // Re-enable close button
-			#endif
-
-			while (!m_ShouldStop && !m_bRestart && !m_TerminateEventRaised)  // These are modified by external threads
-			{
-				std::this_thread::sleep_for(std::chrono::seconds(1));
-			}
-
-			if (m_TerminateEventRaised)
-			{
-				m_ShouldStop = true;
-			}
-
-			// Stop the server:
-			m_WebAdmin->Stop();
-
-			LOG("Shutting down server...");
-			m_Server->Shutdown();
-		}  // if (m_Server->Start())
-		else
-		{
-			m_ShouldStop = true;
-		}
-
-		delete m_MojangAPI; m_MojangAPI = nullptr;
-
-		LOGD("Shutting down deadlock detector...");
-		dd.Stop();
-
-		LOGD("Stopping world threads...");
-		StopWorlds();
-
-		LOGD("Stopping authenticator...");
-		m_Authenticator.Stop();
-
-		LOGD("Freeing MonsterConfig...");
-		delete m_MonsterConfig; m_MonsterConfig = nullptr;
-		delete m_WebAdmin; m_WebAdmin = nullptr;
-
-		LOGD("Unloading recipes...");
-		delete m_FurnaceRecipe;   m_FurnaceRecipe = nullptr;
-		delete m_CraftingRecipes; m_CraftingRecipes = nullptr;
-
-		LOG("Unloading worlds...");
-		UnloadWorlds();
-
-		LOGD("Stopping plugin manager...");
-		delete m_PluginManager; m_PluginManager = nullptr;
-
-		cItemHandler::Deinit();
-
-		LOG("Cleaning up...");
-		delete m_Server; m_Server = nullptr;
-
-		LOG("Shutdown successful!");
+		LOGWARN("Regenerating settings.ini, all settings will be reset");
+		IniFile->AddHeaderComment(" This is the main server configuration");
+		IniFile->AddHeaderComment(" Most of the settings here can be configured using the webadmin interface, if enabled in webadmin.ini");
+		IniFile->AddHeaderComment(" See: http://wiki.mc-server.org/doku.php?id=configure:settings.ini for further configuration help");
 	}
+	auto settingsRepo = cpp14::make_unique<cOverridesSettingsRepository>(std::move(IniFile), std::move(a_OverridesRepo));
+
+	LOG("Starting server...");
+	m_MojangAPI = new cMojangAPI;
+	bool ShouldAuthenticate = settingsRepo->GetValueSetB("Authentication", "Authenticate", true);
+	m_MojangAPI->Start(*settingsRepo, ShouldAuthenticate);  // Mojang API needs to be started before plugins, so that plugins may use it for DB upgrades on server init
+	if (!m_Server->InitServer(*settingsRepo, ShouldAuthenticate))
+	{
+		settingsRepo->Flush();
+		LOGERROR("Failure starting server, aborting...");
+		return;
+	}
+
+	m_WebAdmin = new cWebAdmin();
+	m_WebAdmin->Init();
+
+	LOGD("Loading settings...");
+	m_RankManager.reset(new cRankManager());
+	m_RankManager->Initialize(*m_MojangAPI);
+	m_CraftingRecipes = new cCraftingRecipes;
+	m_FurnaceRecipe   = new cFurnaceRecipe();
+
+	LOGD("Loading worlds...");
+	LoadWorlds(*settingsRepo);
+
+	LOGD("Loading plugin manager...");
+	m_PluginManager = new cPluginManager();
+	m_PluginManager->ReloadPluginsNow(*settingsRepo);
+
+	LOGD("Loading MonsterConfig...");
+	m_MonsterConfig = new cMonsterConfig;
+
+	// This sets stuff in motion
+	LOGD("Starting Authenticator...");
+	m_Authenticator.Start(*settingsRepo);
+
+	LOGD("Starting worlds...");
+	StartWorlds();
+
+	if (settingsRepo->GetValueSetB("DeadlockDetect", "Enabled", true))
+	{
+		LOGD("Starting deadlock detector...");
+		dd.Start(settingsRepo->GetValueSetI("DeadlockDetect", "IntervalSec", 20));
+	}
+
+	settingsRepo->Flush();
+
+	LOGD("Finalising startup...");
+	if (m_Server->Start())
+	{
+		m_WebAdmin->Start();
+
+		#if !defined(ANDROID_NDK)
+		LOGD("Starting InputThread...");
+		try
+		{
+			m_InputThreadRunFlag.test_and_set();
+			m_InputThread = std::thread(InputThread, std::ref(*this));
+		}
+		catch (std::system_error & a_Exception)
+		{
+			LOGERROR("cRoot::Start (std::thread) error %i: could not construct input thread; %s", a_Exception.code().value(), a_Exception.what());
+		}
+		#endif
+
+		LOG("Startup complete, took %ldms!", static_cast<long int>(std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - BeginTime).count()));
+
+		// Save the current time
+		m_StartTime = std::chrono::steady_clock::now();
+
+		#ifdef _WIN32
+		EnableMenuItem(hmenu, SC_CLOSE, MF_ENABLED);  // Re-enable close button
+		#endif
+
+		for (;;)
+		{
+			m_StopEvent.Wait();
+
+			if (m_TerminateEventRaised && m_RunAsService)
+			{
+				// Dont kill if running as a service
+				m_TerminateEventRaised = false;
+			}
+			else
+			{
+				break;
+			}
+		}
+
+		// Stop the server:
+		m_WebAdmin->Stop();
+
+		LOG("Shutting down server...");
+		m_Server->Shutdown();
+	}  // if (m_Server->Start()
+
+	delete m_MojangAPI; m_MojangAPI = nullptr;
+
+	LOGD("Shutting down deadlock detector...");
+	dd.Stop();
+
+	LOGD("Stopping world threads...");
+	StopWorlds();
+
+	LOGD("Stopping authenticator...");
+	m_Authenticator.Stop();
+
+	LOGD("Freeing MonsterConfig...");
+	delete m_MonsterConfig; m_MonsterConfig = nullptr;
+	delete m_WebAdmin; m_WebAdmin = nullptr;
+
+	LOGD("Unloading recipes...");
+	delete m_FurnaceRecipe;   m_FurnaceRecipe = nullptr;
+	delete m_CraftingRecipes; m_CraftingRecipes = nullptr;
+
+	LOG("Unloading worlds...");
+	UnloadWorlds();
+
+	LOGD("Stopping plugin manager...");
+	delete m_PluginManager; m_PluginManager = nullptr;
+
+	cItemHandler::Deinit();
+
+	LOG("Cleaning up...");
+	delete m_Server; m_Server = nullptr;
+
+	m_InputThreadRunFlag.clear();
+	m_InputThread.join();
+
+	LOG("Shutdown successful!");
 
 	LOG("--- Stopped Log ---");
 
@@ -470,19 +482,9 @@ void cRoot::TickCommands(void)
 
 void cRoot::QueueExecuteConsoleCommand(const AString & a_Cmd, cCommandOutputCallback & a_Output)
 {
-	// Some commands are built-in:
-	if (a_Cmd == "stop")
-	{
-		m_ShouldStop = true;
-	}
-	else if (a_Cmd == "restart")
-	{
-		m_bRestart = true;
-	}
-
 	// Put the command into a queue (Alleviates FS #363):
 	cCSLock Lock(m_CSPendingCommands);
-	m_PendingCommands.push_back(cCommand(a_Cmd, &a_Output));
+	m_PendingCommands.emplace_back(a_Cmd, &a_Output);
 }
 
 
@@ -502,15 +504,18 @@ void cRoot::QueueExecuteConsoleCommand(const AString & a_Cmd)
 
 void cRoot::ExecuteConsoleCommand(const AString & a_Cmd, cCommandOutputCallback & a_Output)
 {
-	// cRoot handles stopping and restarting due to our access to controlling variables
+	// Some commands are built-in:
 	if (a_Cmd == "stop")
 	{
-		m_ShouldStop = true;
+		m_TerminateEventRaised = true;
+		m_StopEvent.Set();
+		m_InputThreadRunFlag.clear();
 		return;
 	}
 	else if (a_Cmd == "restart")
 	{
-		m_bRestart = true;
+		m_StopEvent.Set();
+		m_InputThreadRunFlag.clear();
 		return;
 	}
 
